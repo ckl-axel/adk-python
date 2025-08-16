@@ -73,6 +73,7 @@ from ..memory.base_memory_service import BaseMemoryService
 from ..runners import Runner
 from ..sessions.base_session_service import BaseSessionService
 from ..sessions.session import Session
+from ..utils.context_utils import Aclosing
 from .cli_eval import EVAL_SESSION_ID_PREFIX
 from .cli_eval import EvalStatus
 from .utils import cleanup
@@ -154,7 +155,7 @@ class InMemoryExporter(export_lib.SpanExporter):
     self._spans.clear()
 
 
-class AgentRunRequest(common.BaseModel):
+class RunAgentRequest(common.BaseModel):
   app_name: str
   user_id: str
   session_id: str
@@ -821,27 +822,27 @@ class AdkWebServer:
       )
 
     @app.post("/run", response_model_exclude_none=True)
-    async def agent_run(req: AgentRunRequest) -> list[Event]:
+    async def run_agent(req: RunAgentRequest) -> list[Event]:
       session = await self.session_service.get_session(
           app_name=req.app_name, user_id=req.user_id, session_id=req.session_id
       )
       if not session:
         raise HTTPException(status_code=404, detail="Session not found")
       runner = await self.get_runner_async(req.app_name)
-      events = [
-          event
-          async for event in runner.run_async(
+      async with Aclosing(
+          runner.run_async(
               user_id=req.user_id,
               session_id=req.session_id,
               new_message=req.new_message,
           )
-      ]
+      ) as agen:
+        events = [event async for event in agen]
       logger.info("Generated %s events in agent run", len(events))
       logger.debug("Events generated: %s", events)
       return events
 
     @app.post("/run_sse")
-    async def agent_run_sse(req: AgentRunRequest) -> StreamingResponse:
+    async def run_agent_sse(req: RunAgentRequest) -> StreamingResponse:
       # SSE endpoint
       session = await self.session_service.get_session(
           app_name=req.app_name, user_id=req.user_id, session_id=req.session_id
@@ -856,19 +857,24 @@ class AdkWebServer:
               StreamingMode.SSE if req.streaming else StreamingMode.NONE
           )
           runner = await self.get_runner_async(req.app_name)
-          async for event in runner.run_async(
-              user_id=req.user_id,
-              session_id=req.session_id,
-              new_message=req.new_message,
-              state_delta=req.state_delta,
-              run_config=RunConfig(streaming_mode=stream_mode),
-          ):
-            # Format as SSE data
-            sse_event = event.model_dump_json(exclude_none=True, by_alias=True)
-            logger.debug(
-                "Generated event in agent run streaming: %s", sse_event
-            )
-            yield f"data: {sse_event}\n\n"
+          async with Aclosing(
+              runner.run_async(
+                  user_id=req.user_id,
+                  session_id=req.session_id,
+                  new_message=req.new_message,
+                  state_delta=req.state_delta,
+                  run_config=RunConfig(streaming_mode=stream_mode),
+              )
+          ) as agen:
+            async for event in agen:
+              # Format as SSE data
+              sse_event = event.model_dump_json(
+                  exclude_none=True, by_alias=True
+              )
+              logger.debug(
+                  "Generated event in agent run streaming: %s", sse_event
+              )
+              yield f"data: {sse_event}\n\n"
         except Exception as e:
           logger.exception("Error in event_generator: %s", e)
           # You might want to yield an error event here
@@ -930,7 +936,7 @@ class AdkWebServer:
         return {}
 
     @app.websocket("/run_live")
-    async def agent_live_run(
+    async def run_agent_live(
         websocket: WebSocket,
         app_name: str,
         user_id: str,
@@ -954,12 +960,15 @@ class AdkWebServer:
 
       async def forward_events():
         runner = await self.get_runner_async(app_name)
-        async for event in runner.run_live(
-            session=session, live_request_queue=live_request_queue
-        ):
-          await websocket.send_text(
-              event.model_dump_json(exclude_none=True, by_alias=True)
-          )
+        async with Aclosing(
+            runner.run_live(
+                session=session, live_request_queue=live_request_queue
+            )
+        ) as agen:
+          async for event in agen:
+            await websocket.send_text(
+                event.model_dump_json(exclude_none=True, by_alias=True)
+            )
 
       async def process_messages():
         try:
